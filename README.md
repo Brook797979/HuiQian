@@ -1,43 +1,65 @@
-# 慧签 HuiQian · 智能考勤后端
+# 慧签 HuiQian · 智能考勤系统
 
-低成本、离线可用、双因子（指纹+人脸+活体）防代签考勤系统 —— 树莓派 5 后端 + K210 端侧 + 微信小程序/桌面端。
+> 低成本、离线可用、**双因子（指纹+人脸）+ 活体防代签** 的完整考勤系统。
+> 架构：**K210 端侧触发 + 树莓派 5 核心 + AS608 指纹 + 微信小程序/桌面端**。
 
-## 目录结构
-| 路径 | 说明 |
-|---|---|
-| `app.py` | Flask 后端 API（小程序/桌面端调用，约 25 个接口） |
-| `attendance.py` | 数据层：SQLite、打卡规则（无限/窗口）、周统计、密码管理 |
-| `face_engine.py` | 人脸识别：MediaPipe 检测/关键点 + dlib 128 维特征 + 活体（摇头/眨眼） |
-| `as608.py` | AS608 光学指纹模块驱动 |
-| `voice.py` | 语音播报（aplay → bluealsa → 蓝牙音箱，自动重连） |
-| `k210_link.py` | K210 联动服务：串口协议、打卡/录入、指纹、语音 |
-| `enroll.py` / `enroll_fp.py` | 录入辅助 |
-| `models/` | MediaPipe 人脸检测/关键点模型 |
-| `voice/` | 23 条预生成语音 |
-| `systemd/` | 开机自启服务配置 |
-| `scripts/` | 网络/蓝牙/部署脚本 |
-| `k210/` | K210 端固件（k210_main_standalone.py）与刷机脚本 |
+## ✨ 亮点
+- 🔐 **双因子防代签**：指纹（你有的）+ 人脸（你是的）+ 摇头/眨眼活体（防照片/视频）
+- 💰 **低成本**：核心硬件 ≤150 元，远低于商用考勤机
+- 📴 **完全离线**：数据本地存储，断网照常打卡
+- 🔗 **全链路闭环**：硬件 → 识别 → 数据库 → API → 小程序/桌面，一键打卡、周统计、排行榜
+- 🔊 **人性化语音**：当天第一位"早起的鸟儿有虫吃"、21 点后"辛苦了晚安"、时段结束前放大音量提醒
 
-## 快速启动（树莓派5）
-```bash
-pip install -r requirements.txt
-# 后端 API
-python3 app.py                 # 0.0.0.0:8000
-# 联动服务（需 K210 串口）
-python3 k210_link.py
+## 🏗 项目结构
 ```
-开机自启：把 `systemd/*.service` 复制到 `/etc/systemd/system/` 并 `systemctl enable`。
+├── backend/                 # 树莓派 5 后端（核心）
+│   ├── app.py              # Flask API（约 25 个接口，供小程序/桌面调用）
+│   ├── attendance.py       # 数据层：SQLite / 打卡规则 / 周统计 / 密码
+│   ├── face_engine.py      # 人脸识别：MediaPipe + dlib 128维特征 + 活体
+│   ├── as608.py            # AS608 指纹模块驱动
+│   ├── voice.py            # 语音播报（aplay → bluealsa → 蓝牙音箱）
+│   ├── k210_link.py        # K210 联动服务（串口协议/打卡/录入/指纹）
+│   ├── enroll.py / enroll_fp.py   # 录入辅助
+│   ├── models/             # MediaPipe 人脸模型
+│   ├── voice/              # 23 条预生成语音
+│   ├── systemd/            # 开机自启服务
+│   └── scripts/            # 网络/蓝牙/部署脚本
+├── k210/                   # K210 端固件 + 刷机脚本
+│   ├── k210_main_standalone.py   # K210 主程序（面板/打卡/录入/排行榜）
+│   └── push_file.py / push_main_chunked.py   # 刷机工具
+├── docs/
+│   ├── 小程序API接口文档.md
+│   └── 答辩技术文档.md
+└── README.md
+```
 
-## 联网说明（重要）
-- 稳定方案：**树莓派自开热点 `HuiQian`（密码 12345678）**，手机/电脑连上后访问 `http://10.42.0.1:8000`。
-- 小程序真机/开发者工具需勾选「不校验合法域名」。
+## 🚀 快速启动（树莓派 5）
+```bash
+cd backend
+pip install -r requirements.txt
+python3 app.py            # 后端 API → 0.0.0.0:8000
+python3 k210_link.py      # 联动服务（需 K210 串口）
+```
+开机自启：把 `backend/systemd/*.service` 复制到 `/etc/systemd/system/` 并 `systemctl enable`。
+K210 固件烧录：`python3 k210/push_file.py k210/k210_main_standalone.py /flash/main.py`（K210 需连电脑 COM 口）。
 
-## 密码登录
-- 录入人脸时自动生成默认密码 `123456qmx`；
+## 🌐 网络方案（稳定：Pi 自开热点）
+- 树莓派开机自动开热点 **`HuiQian`（密码 `12345678`）**，IP `10.42.0.1`；
+- 电脑/手机连上热点后，后端地址 = **`http://10.42.0.1:8000`**；
+- 小程序/真机需勾选「不校验合法域名」；接口细节见 `docs/小程序API接口文档.md`。
+
+## 🔑 密码登录
+- 录入人脸时自动生成默认密码 **`123456qmx`**；
 - `/api/login`（姓名+密码）登录并绑定 openid；`/api/set_password` 管理员改密码；
-- 规则：≥8 位、至少两种字符；密码加盐哈希存储。
+- 规则：≥8 位、至少两种字符；密码**加盐哈希**存储。
 
-## API 一览（约 25 个）
-health / login / bind / me / set_role / users / records / weekly / stats / activity / presence /
-enroll / punch / rename / delete_user / delete_face / delete_fp / fingerprint/bind / fingerprint/list /
-fingerprint/enroll / settings(GET/POST) / face_samples
+## 🖥 核心流程
+| 流程 | 说明 |
+|---|---|
+| 打卡 | K210 检测人脸 → TRIGGER → Pi 指纹(可选) → 人脸+摇头活体 → 写库+语音 |
+| 录入 | 录入信息：人脸 3 张 →（有 AS608）指纹 2 次 → 自动编号/默认密码 |
+| 排行榜 | K210 请求 → Pi 生成排行图片 → K210 显示翻页 |
+| 小程序 | 登录 → 我的/周统计/明细/照片/排行榜/在场人数 |
+
+## 🤝 团队
+2 软件 + 2 硬件，全链路自研（含自制蓝牙音箱、自主调试解决蜂鸣器/串口/音频等工程问题）。
