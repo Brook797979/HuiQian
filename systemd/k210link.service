@@ -1,0 +1,15 @@
+[Unit]
+Description=Huiqian K210 Link
+After=network.target huiqian-audio.service huiqian-bt.service
+Wants=huiqian-audio.service huiqian-bt.service
+
+[Service]
+User=sankela
+WorkingDirectory=/home/sankela/huiqian
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/bin/python3 /home/sankela/huiqian/k210_link.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

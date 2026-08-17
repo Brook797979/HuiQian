@@ -1,0 +1,10 @@
+[Unit]
+Description=Huiqian audio auto config (USB speaker)
+After=sound.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash /home/sankela/huiqian/setup_audio.sh
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.db
+face_library/
+static/
+*.log
+.DS_Store

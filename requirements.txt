@@ -1,0 +1,7 @@
+﻿flask
+picamera2
+opencv-python
+mediapipe
+dlib
+face-recognition
+numpy
