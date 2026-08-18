@@ -7,7 +7,7 @@
 - 打卡记录:  records 表
 - 外键级联删除 + 索引, 无冗余字段
 """
-import os, re, json, sqlite3, datetime, hashlib
+import os, re, json, sqlite3, datetime, hashlib, hmac, secrets
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(BASE, 'huiqian.db')
@@ -71,6 +71,25 @@ def init_db():
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS admin_accounts(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+      password_hash TEXT NOT NULL,
+      account_type TEXT NOT NULL DEFAULT 'admin' CHECK(account_type IN ('super_admin', 'admin')),
+      enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+      created_at TEXT NOT NULL,
+      last_login_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS admin_sessions(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_hash TEXT NOT NULL UNIQUE,
+      admin_id INTEGER NOT NULL REFERENCES admin_accounts(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      revoked_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_admin_sessions_admin ON admin_sessions(admin_id);
+    CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires ON admin_sessions(expires_at);
     ''')
     # 兼容旧库: 移除 users.face_embedding 遗留列
     cols = [r[1] for r in conn.execute('PRAGMA table_info(users)').fetchall()]
@@ -86,12 +105,296 @@ def init_db():
         conn.execute('ALTER TABLE users ADD COLUMN password TEXT')
     conn.execute("UPDATE users SET password=? WHERE password IS NULL",
                  (_hash_pw(DEFAULT_PASSWORD),))
+    acols = [r[1] for r in conn.execute('PRAGMA table_info(admin_accounts)').fetchall()]
+    if 'account_type' not in acols:
+        conn.execute("ALTER TABLE admin_accounts ADD COLUMN account_type TEXT NOT NULL DEFAULT 'admin'")
+    super_count = conn.execute(
+        "SELECT COUNT(*) FROM admin_accounts WHERE account_type='super_admin'"
+    ).fetchone()[0]
+    if not super_count:
+        first_admin = conn.execute(
+            "SELECT id FROM admin_accounts WHERE enabled=1 ORDER BY id LIMIT 1"
+        ).fetchone()
+        if first_admin is None:
+            first_admin = conn.execute(
+                "SELECT id FROM admin_accounts ORDER BY id LIMIT 1"
+            ).fetchone()
+        if first_admin is not None:
+            conn.execute(
+                "UPDATE admin_accounts SET account_type='super_admin' WHERE id=?",
+                (first_admin['id'],),
+            )
     conn.commit()
     conn.close()
 
 
 def now_str():
     return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _future_str(seconds):
+    return (datetime.datetime.now() + datetime.timedelta(seconds=int(seconds))).strftime(
+        '%Y-%m-%d %H:%M:%S'
+    )
+
+
+# ---------- 管理员账号和会话 ----------
+ADMIN_PASSWORD_ITERATIONS = 210000
+ADMIN_SESSION_TTL_SECONDS = 12 * 60 * 60
+ADMIN_TYPE_SUPER = 'super_admin'
+ADMIN_TYPE_REGULAR = 'admin'
+
+
+def validate_admin_username(username):
+    value = str(username or '').strip()
+    if not re.fullmatch(r'[A-Za-z0-9_-]{3,32}', value):
+        return None
+    return value
+
+
+def validate_admin_password(password):
+    value = str(password or '')
+    if len(value) < 10:
+        return False, 'password must contain at least 10 characters'
+    categories = sum((
+        any('a' <= c <= 'z' for c in value),
+        any('A' <= c <= 'Z' for c in value),
+        any('0' <= c <= '9' for c in value),
+        any(not c.isalnum() for c in value),
+    ))
+    if categories < 2:
+        return False, 'password must contain at least two character categories'
+    return True, ''
+
+
+def _hash_admin_password(password, salt=None):
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        'sha256', str(password).encode('utf-8'), salt, ADMIN_PASSWORD_ITERATIONS
+    )
+    return 'pbkdf2_sha256$%d$%s$%s' % (
+        ADMIN_PASSWORD_ITERATIONS, salt.hex(), digest.hex()
+    )
+
+
+def _check_admin_password(password, stored):
+    try:
+        algorithm, raw_iterations, salt_hex, digest_hex = str(stored).split('$', 3)
+        if algorithm != 'pbkdf2_sha256':
+            return False
+        expected = hashlib.pbkdf2_hmac(
+            'sha256', str(password).encode('utf-8'), bytes.fromhex(salt_hex), int(raw_iterations)
+        )
+        return hmac.compare_digest(expected.hex(), digest_hex)
+    except (TypeError, ValueError):
+        return False
+
+
+def public_admin(row):
+    return {
+        'id': int(row['id']),
+        'username': row['username'],
+        'account_type': row['account_type'],
+        'enabled': int(row['enabled']),
+        'created_at': row['created_at'],
+        'last_login_at': row['last_login_at'],
+    }
+
+
+def is_super_admin(row):
+    return row is not None and row['account_type'] == ADMIN_TYPE_SUPER
+
+
+def create_admin(username, password, account_type=ADMIN_TYPE_REGULAR):
+    clean_username = validate_admin_username(username)
+    if clean_username is None:
+        return None, 'USERNAME_INVALID'
+    ok, _ = validate_admin_password(password)
+    if not ok:
+        return None, 'PASSWORD_INVALID'
+    if account_type not in (ADMIN_TYPE_SUPER, ADMIN_TYPE_REGULAR):
+        return None, 'ACCOUNT_TYPE_INVALID'
+    conn = get_db()
+    try:
+        if account_type == ADMIN_TYPE_REGULAR:
+            super_count = conn.execute(
+                "SELECT COUNT(*) FROM admin_accounts WHERE account_type='super_admin'"
+            ).fetchone()[0]
+            if not super_count:
+                account_type = ADMIN_TYPE_SUPER
+        conn.execute(
+            'INSERT INTO admin_accounts(username, password_hash, account_type, enabled, created_at) VALUES (?,?,?,1,?)',
+            (clean_username, _hash_admin_password(password), account_type, now_str()),
+        )
+        conn.commit()
+        row = conn.execute('SELECT * FROM admin_accounts WHERE username=?', (clean_username,)).fetchone()
+        return row, None
+    except sqlite3.IntegrityError:
+        return None, 'ADMIN_ACCOUNT_EXISTS'
+    finally:
+        conn.close()
+
+
+def list_admins():
+    conn = get_db()
+    rows = conn.execute('SELECT * FROM admin_accounts ORDER BY id').fetchall()
+    conn.close()
+    return rows
+
+
+def get_admin_by_id(admin_id):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM admin_accounts WHERE id=?', (int(admin_id),)).fetchone()
+    conn.close()
+    return row
+
+
+def authenticate_admin(username, password):
+    clean_username = validate_admin_username(username)
+    if clean_username is None:
+        return None
+    conn = get_db()
+    row = conn.execute('SELECT * FROM admin_accounts WHERE username=?', (clean_username,)).fetchone()
+    if row is None or not int(row['enabled']) or not _check_admin_password(password, row['password_hash']):
+        conn.close()
+        return None
+    now = now_str()
+    conn.execute('UPDATE admin_accounts SET last_login_at=? WHERE id=?', (now, row['id']))
+    conn.commit()
+    row = conn.execute('SELECT * FROM admin_accounts WHERE id=?', (row['id'],)).fetchone()
+    conn.close()
+    return row
+
+
+def _token_hash(token):
+    return hashlib.sha256(str(token).encode('utf-8')).hexdigest()
+
+
+def issue_admin_session(admin_id, ttl_seconds=ADMIN_SESSION_TTL_SECONDS):
+    token = secrets.token_urlsafe(32)
+    conn = get_db()
+    try:
+        conn.execute(
+            'INSERT INTO admin_sessions(token_hash, admin_id, created_at, expires_at) VALUES (?,?,?,?)',
+            (_token_hash(token), int(admin_id), now_str(), _future_str(ttl_seconds)),
+        )
+        conn.commit()
+        row = conn.execute(
+            'SELECT * FROM admin_sessions WHERE token_hash=?', (_token_hash(token),)
+        ).fetchone()
+        return token, row
+    finally:
+        conn.close()
+
+
+def resolve_admin_session(token):
+    raw_token = str(token or '').strip()
+    if not raw_token:
+        return None
+    conn = get_db()
+    try:
+        row = conn.execute(
+            '''SELECT s.id AS session_id, s.admin_id, s.expires_at, s.revoked_at,
+                      a.id, a.username, a.account_type, a.enabled, a.created_at, a.last_login_at
+               FROM admin_sessions s
+               JOIN admin_accounts a ON a.id=s.admin_id
+               WHERE s.token_hash=?''',
+            (_token_hash(raw_token),),
+        ).fetchone()
+        if row is None or row['revoked_at'] is not None or row['expires_at'] <= now_str() or not int(row['enabled']):
+            return None
+        return row
+    finally:
+        conn.close()
+
+
+def revoke_admin_session(session_id):
+    conn = get_db()
+    try:
+        conn.execute(
+            'UPDATE admin_sessions SET revoked_at=? WHERE id=? AND revoked_at IS NULL',
+            (now_str(), int(session_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_admin_enabled(admin_id, enabled):
+    target_id = int(admin_id)
+    wanted = 1 if bool(enabled) else 0
+    conn = get_db()
+    try:
+        row = conn.execute('SELECT * FROM admin_accounts WHERE id=?', (target_id,)).fetchone()
+        if row is None:
+            return None, 'ADMIN_NOT_FOUND'
+        if not wanted and int(row['enabled']) and is_super_admin(row):
+            enabled_super_count = conn.execute(
+                "SELECT COUNT(*) FROM admin_accounts WHERE enabled=1 AND account_type='super_admin'"
+            ).fetchone()[0]
+            if enabled_super_count <= 1:
+                return None, 'LAST_SUPER_ADMIN_PROTECTED'
+        conn.execute('UPDATE admin_accounts SET enabled=? WHERE id=?', (wanted, target_id))
+        if not wanted:
+            conn.execute(
+                'UPDATE admin_sessions SET revoked_at=? WHERE admin_id=? AND revoked_at IS NULL',
+                (now_str(), target_id),
+            )
+        conn.commit()
+        row = conn.execute('SELECT * FROM admin_accounts WHERE id=?', (target_id,)).fetchone()
+        return row, None
+    finally:
+        conn.close()
+
+
+def reset_admin_password(admin_id, password):
+    ok, _ = validate_admin_password(password)
+    if not ok:
+        return None, 'PASSWORD_INVALID'
+    conn = get_db()
+    try:
+        row = conn.execute('SELECT * FROM admin_accounts WHERE id=?', (int(admin_id),)).fetchone()
+        if row is None:
+            return None, 'ADMIN_NOT_FOUND'
+        conn.execute(
+            'UPDATE admin_accounts SET password_hash=? WHERE id=?',
+            (_hash_admin_password(password), int(admin_id)),
+        )
+        conn.execute(
+            'UPDATE admin_sessions SET revoked_at=? WHERE admin_id=? AND revoked_at IS NULL',
+            (now_str(), int(admin_id)),
+        )
+        conn.commit()
+        row = conn.execute('SELECT * FROM admin_accounts WHERE id=?', (int(admin_id),)).fetchone()
+        return row, None
+    finally:
+        conn.close()
+
+
+def change_own_admin_password(admin_id, current_password, new_password):
+    ok, _ = validate_admin_password(new_password)
+    if not ok:
+        return None, 'PASSWORD_INVALID'
+    conn = get_db()
+    try:
+        row = conn.execute('SELECT * FROM admin_accounts WHERE id=?', (int(admin_id),)).fetchone()
+        if row is None:
+            return None, 'ADMIN_NOT_FOUND'
+        if not _check_admin_password(current_password, row['password_hash']):
+            return None, 'CURRENT_PASSWORD_INVALID'
+        conn.execute(
+            'UPDATE admin_accounts SET password_hash=? WHERE id=?',
+            (_hash_admin_password(new_password), int(admin_id)),
+        )
+        conn.execute(
+            'UPDATE admin_sessions SET revoked_at=? WHERE admin_id=? AND revoked_at IS NULL',
+            (now_str(), int(admin_id)),
+        )
+        conn.commit()
+        row = conn.execute('SELECT * FROM admin_accounts WHERE id=?', (int(admin_id),)).fetchone()
+        return row, None
+    finally:
+        conn.close()
 
 
 # ---------- 密码 ----------

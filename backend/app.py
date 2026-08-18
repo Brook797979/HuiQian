@@ -2,8 +2,9 @@
 import os, io, re, shutil, time, datetime, sqlite3
 import cv2, numpy as np
 import threading
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, g, request, jsonify, send_from_directory
 import face_engine, attendance
+from auth_middleware import require_admin, require_super_admin
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 PHOTO_DIR = os.path.join(BASE, 'static', 'photos')
@@ -55,6 +56,7 @@ def parse_image(req):
 
 
 @app.post('/api/enroll')
+@require_admin
 def enroll():
     """录入: multipart name + image; 照片存 face_library/<姓名>/, 特征存 face_samples(可多张)"""
     name = (request.form.get('name') or '').strip()
@@ -116,6 +118,7 @@ def punch():
 
 
 @app.get('/api/users')
+@require_admin
 def users():
     conn = attendance.get_db()
     rows = conn.execute('''
@@ -128,6 +131,7 @@ def users():
 
 
 @app.get('/api/records')
+@require_admin
 def records():
     uid = request.args.get('user_id', type=int)
     day = request.args.get('date')
@@ -150,6 +154,7 @@ def records():
 
 
 @app.get('/api/weekly')
+@require_admin
 def weekly():
     uid = request.args.get('user_id', type=int)
     ws = request.args.get('week_start')          # YYYY-MM-DD 周一起始
@@ -170,6 +175,118 @@ def health():
     return jsonify(ok=True, msg='慧签后端运行中')
 
 
+
+
+def _admin_actor():
+    return 'admin:' + g.admin['username']
+
+
+@app.post('/api/admin/auth/login')
+def admin_login():
+    data = request.get_json(silent=True) or {}
+    account = attendance.authenticate_admin(data.get('username'), data.get('password'))
+    if account is None:
+        return jsonify(ok=False, code='ADMIN_CREDENTIALS_INVALID', msg='administrator credentials are invalid'), 401
+    token, session = attendance.issue_admin_session(account['id'])
+    attendance.log_action('admin:' + account['username'], 'administrator login', 'session issued')
+    return jsonify(
+        ok=True,
+        token=token,
+        expires_at=session['expires_at'],
+        admin=attendance.public_admin(account),
+    )
+
+
+@app.post('/api/admin/auth/logout')
+@require_admin
+def admin_logout():
+    attendance.revoke_admin_session(g.admin_session['session_id'])
+    attendance.log_action(_admin_actor(), 'administrator logout', 'session revoked')
+    return jsonify(ok=True)
+
+
+@app.get('/api/admin/auth/me')
+@require_admin
+def admin_me():
+    return jsonify(ok=True, admin=attendance.public_admin(g.admin))
+
+
+@app.get('/api/admin/accounts')
+@require_super_admin
+def admin_accounts():
+    return jsonify(ok=True, admins=[attendance.public_admin(row) for row in attendance.list_admins()])
+
+
+@app.post('/api/admin/accounts')
+@require_super_admin
+def create_admin_account():
+    data = request.get_json(silent=True) or {}
+    account, error = attendance.create_admin(
+        data.get('username'), data.get('password'), attendance.ADMIN_TYPE_REGULAR
+    )
+    if error == 'USERNAME_INVALID':
+        return jsonify(ok=False, code=error, msg='username must use 3 to 32 letters, digits, underscores, or hyphens'), 400
+    if error == 'PASSWORD_INVALID':
+        return jsonify(ok=False, code=error, msg='password does not meet administrator password requirements'), 400
+    if error == 'ADMIN_ACCOUNT_EXISTS':
+        return jsonify(ok=False, code=error, msg='administrator username already exists'), 409
+    attendance.log_action(_admin_actor(), 'create administrator', 'username=' + account['username'])
+    return jsonify(ok=True, admin=attendance.public_admin(account)), 201
+
+
+@app.post('/api/admin/accounts/<int:admin_id>/status')
+@require_super_admin
+def update_admin_status(admin_id):
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data.get('enabled'), bool):
+        return jsonify(ok=False, code='ENABLED_REQUIRED', msg='enabled must be a boolean'), 400
+    target = attendance.get_admin_by_id(admin_id)
+    if target is None:
+        return jsonify(ok=False, code='ADMIN_NOT_FOUND', msg='administrator account was not found'), 404
+    if attendance.is_super_admin(target):
+        return jsonify(ok=False, code='SUPER_ADMIN_PROTECTED', msg='super administrator accounts can only be changed on the Raspberry Pi'), 403
+    account, error = attendance.set_admin_enabled(admin_id, data['enabled'])
+    if error == 'ADMIN_NOT_FOUND':
+        return jsonify(ok=False, code=error, msg='administrator account was not found'), 404
+    if error == 'LAST_SUPER_ADMIN_PROTECTED':
+        return jsonify(ok=False, code=error, msg='the last enabled super administrator cannot be disabled'), 409
+    attendance.log_action(_admin_actor(), 'update administrator status', 'id=%d enabled=%d' % (admin_id, int(account['enabled'])))
+    return jsonify(ok=True, admin=attendance.public_admin(account))
+
+
+@app.post('/api/admin/accounts/<int:admin_id>/password')
+@require_super_admin
+def update_admin_password(admin_id):
+    data = request.get_json(silent=True) or {}
+    target = attendance.get_admin_by_id(admin_id)
+    if target is None:
+        return jsonify(ok=False, code='ADMIN_NOT_FOUND', msg='administrator account was not found'), 404
+    if attendance.is_super_admin(target):
+        return jsonify(ok=False, code='SUPER_ADMIN_PROTECTED', msg='super administrator passwords can only be changed by that account'), 403
+    account, error = attendance.reset_admin_password(admin_id, data.get('password'))
+    if error == 'ADMIN_NOT_FOUND':
+        return jsonify(ok=False, code=error, msg='administrator account was not found'), 404
+    if error == 'PASSWORD_INVALID':
+        return jsonify(ok=False, code=error, msg='password does not meet administrator password requirements'), 400
+    attendance.log_action(_admin_actor(), 'reset administrator password', 'id=%d' % admin_id)
+    return jsonify(ok=True, admin=attendance.public_admin(account))
+
+
+@app.post('/api/admin/auth/password')
+@require_admin
+def change_own_admin_password():
+    data = request.get_json(silent=True) or {}
+    account, error = attendance.change_own_admin_password(
+        g.admin['id'], data.get('current_password'), data.get('new_password')
+    )
+    if error == 'CURRENT_PASSWORD_INVALID':
+        return jsonify(ok=False, code=error, msg='current password is invalid'), 401
+    if error == 'PASSWORD_INVALID':
+        return jsonify(ok=False, code=error, msg='password does not meet administrator password requirements'), 400
+    if error == 'ADMIN_NOT_FOUND':
+        return jsonify(ok=False, code=error, msg='administrator account was not found'), 404
+    attendance.log_action(_admin_actor(), 'change own administrator password', 'session revoked')
+    return jsonify(ok=True, admin=attendance.public_admin(account))
 
 
 @app.post('/api/bind')
@@ -216,6 +333,7 @@ def me():
 
 
 @app.post('/api/set_role')
+@require_admin
 def set_role():
     """设置角色: json {user_id, role} (0=学生 1=管理员)"""
     data = request.get_json(silent=True) or {}
@@ -239,6 +357,7 @@ def safe_folder(name):
     return s or 'user'
 
 @app.get('/api/face_samples')
+@require_admin
 def face_samples_api():
     """查看人脸样本列表 (可选 user_id)"""
     uid = request.args.get('user_id', type=int)
@@ -247,6 +366,7 @@ def face_samples_api():
 
 
 @app.post('/api/fingerprint/bind')
+@require_admin
 def fp_bind():
     """绑定指纹: json {user_id, fp_id} (fp_id=AS608 模块槽位号)"""
     data = request.get_json(silent=True) or {}
@@ -259,12 +379,14 @@ def fp_bind():
 
 
 @app.get('/api/fingerprint/list')
+@require_admin
 def fp_list():
     """指纹映射列表"""
     return jsonify(ok=True, fingerprints=[dict(r) for r in attendance.list_fingerprints()])
 
 
 @app.post('/api/rename')
+@require_admin
 def rename():
     """改名: json {user_id, name}; 同步改数据库 + face_library 文件夹"""
     data = request.get_json(silent=True) or {}
@@ -294,6 +416,7 @@ def rename():
     return jsonify(ok=True)
 
 @app.get('/api/stats')
+@require_admin
 def stats_api():
     """本周每人统计(打卡次数/总时长/排名)"""
     import datetime as dt
@@ -303,12 +426,14 @@ def stats_api():
 
 
 @app.get('/api/activity')
+@require_admin
 def activity_api():
     """操作日志(谁/什么时间/做了什么)"""
     return jsonify(ok=True, logs=[dict(r) for r in attendance.list_activity()])
 
 
 @app.get('/api/presence')
+@require_admin
 def presence_api():
     """实时在场人数(当天最后一条打卡为 in 且未超时)"""
     users = attendance.current_presence()
@@ -317,6 +442,7 @@ def presence_api():
 
 
 @app.post('/api/delete_user')
+@require_admin
 def delete_user_api():
     """删除用户: 级联删数据库(人脸/指纹/记录) + 删 face_library 文件夹"""
     data = request.get_json(silent=True) or {}
@@ -347,6 +473,7 @@ def _parse_min(s):
 
 
 @app.post('/api/delete_face')
+@require_admin
 def delete_face_api():
     """只删人脸(保留用户/指纹/记录)"""
     data = request.get_json(silent=True) or {}
@@ -360,6 +487,7 @@ def delete_face_api():
 
 
 @app.post('/api/delete_fp')
+@require_admin
 def delete_fp_api():
     """只删指纹绑定"""
     data = request.get_json(silent=True) or {}
@@ -371,6 +499,7 @@ def delete_fp_api():
 
 
 @app.post('/api/fingerprint/enroll')
+@require_admin
 def fp_enroll_api():
     """录入指纹(服务器操AS608+语音提示): 用户按2次手指; 绑定到 user_id"""
     data = request.get_json(silent=True) or {}
@@ -450,6 +579,7 @@ def login_api():
 
 
 @app.post('/api/set_password')
+@require_admin
 def set_password_api():
     """管理员改密码: user_id + new_password (至少8位, 含两种字符)"""
     data = request.get_json(silent=True) or {}
@@ -470,6 +600,7 @@ def set_password_api():
 
 
 @app.get('/api/settings')
+@require_admin
 def settings_get():
     """打卡设置: 模式(unlimited/window) + 时间区间 + 签退截止"""
     mode = attendance.get_punch_mode()
@@ -480,6 +611,7 @@ def settings_get():
 
 
 @app.post('/api/settings')
+@require_admin
 def settings_set():
     """保存打卡设置: json {punch_mode?, windows?:[['07:30','10:00'],...], out_deadline?:'23:00'}"""
     data = request.get_json(silent=True) or {}
