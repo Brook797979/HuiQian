@@ -15,6 +15,9 @@
 ├── backend/                 # 树莓派 5 后端（核心）
 │   ├── app.py              # Flask API（约 25 个接口，供小程序/桌面调用）
 │   ├── attendance.py       # 数据层：SQLite / 打卡规则 / 周统计 / 密码
+│   ├── auth_middleware.py  # 网页管理端 Bearer Token 管理员认证
+│   ├── admin_cli.py        # 初始化管理员账号的命令行工具
+│   ├── tests/              # 后端认证与接口保护测试
 │   ├── face_engine.py      # 人脸识别：MediaPipe + dlib 128维特征 + 活体
 │   ├── as608.py            # AS608 指纹模块驱动
 │   ├── voice.py            # 语音播报（aplay → bluealsa → 蓝牙音箱）
@@ -52,6 +55,68 @@ K210 固件烧录：`python3 k210/push_file.py k210/k210_main_standalone.py /fla
 - 录入人脸时自动生成默认密码 **`123456qmx`**；
 - `/api/login`（姓名+密码）登录并绑定 openid；`/api/set_password` 管理员改密码；
 - 规则：≥8 位、至少两种字符；密码**加盐哈希**存储。
+
+## 🛡️ 网页管理端管理员登录
+
+网页管理端使用独立的 `admin_accounts` 表，不复用学生 `users` 表，也不依赖微信 `openid`。管理员密码使用 PBKDF2-SHA256 哈希保存，登录后返回 12 小时有效的 Bearer Token。
+
+首次在树莓派初始化管理员（只执行一次）：
+
+```bash
+cd backend
+python3 admin_cli.py create-admin --username admin
+```
+
+命令行会交互式要求输入两次密码。管理员用户名只能使用 3～32 位字母、数字、下划线或连字符；密码至少 10 位，并至少包含两类字符。不要把真实密码写进代码或提交到仓库。
+
+网页先请求登录接口：
+
+```http
+POST /api/admin/auth/login
+Content-Type: application/json
+
+{"username":"admin","password":"你的管理员密码"}
+```
+
+登录成功后，把返回的 `token` 放入后续管理请求的请求头：
+
+```http
+Authorization: Bearer <token>
+```
+
+管理员认证接口：
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| POST | `/api/admin/auth/login` | 管理员登录并签发会话令牌 |
+| POST | `/api/admin/auth/logout` | 撤销当前会话 |
+| GET | `/api/admin/auth/me` | 查询当前管理员 |
+| GET | `/api/admin/accounts` | 查看管理员账号 |
+| POST | `/api/admin/accounts` | 新增管理员 |
+| POST | `/api/admin/accounts/<id>/status` | 启用或禁用管理员 |
+| POST | `/api/admin/accounts/<id>/password` | 重置管理员密码 |
+
+网页管理端使用的用户、考勤、统计、样本、指纹和系统设置接口均要求这个请求头。`/api/health`、`/api/punch`、`/api/login`、`/api/bind`、`/api/me` 保持公开，供硬件打卡和学生端使用。
+
+退出登录、禁用账号或重置密码后，原会话令牌立即失效；系统始终保留至少一个启用的管理员，避免后台无人可登录。
+
+部署或迁移树莓派时至少备份：
+
+```text
+backend/huiqian.db
+backend/face_library/
+backend/static/photos/
+```
+
+其中 `huiqian.db` 包含管理员账号哈希、会话、学生、样本索引和考勤记录；不要在日志、截图或网页前端保存管理员密码。
+
+认证测试运行方式（开发机或树莓派虚拟环境）：
+
+```bash
+cd backend
+python3 -m unittest tests.test_admin_auth -v
+python3 -m py_compile app.py attendance.py auth_middleware.py admin_cli.py
+```
 
 ## 🖥 核心流程
 | 流程 | 说明 |
