@@ -2,6 +2,7 @@
 import os, io, re, shutil, time, datetime, sqlite3
 import cv2, numpy as np
 import threading
+from functools import wraps
 from flask import Flask, g, request, jsonify, send_from_directory
 import face_engine, attendance
 from auth_middleware import require_admin, require_super_admin
@@ -173,6 +174,92 @@ def photo(fn):
 @app.get('/api/health')
 def health():
     return jsonify(ok=True, msg='慧签后端运行中')
+
+
+# ==================== 小程序学生端接口 ====================
+# 学生端只使用登录后绑定的 openid，不复用管理员 Bearer Token。
+def require_student(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        openid = (request.args.get('openid') or request.headers.get('X-MiniProgram-OpenID') or '').strip()
+        if not openid:
+            return jsonify(ok=False, code='STUDENT_OPENID_REQUIRED', msg='缺少小程序 openid'), 401
+        user = attendance.get_user_by_openid(openid)
+        if user is None:
+            return jsonify(ok=False, code='STUDENT_NOT_BOUND', msg='小程序尚未绑定学生账号'), 401
+        g.student_openid = openid
+        g.student_user = user
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def _student_public_user(user):
+    data = dict(user)
+    data.pop('password', None)
+    return data
+
+
+@app.get('/api/student/me')
+@require_student
+def student_me():
+    return jsonify(ok=True, user=_student_public_user(g.student_user))
+
+
+@app.get('/api/student/records')
+@require_student
+def student_records():
+    """返回当前绑定学生自己的打卡记录，不能通过参数读取其他用户。"""
+    day = request.args.get('date')
+    conn = attendance.get_db()
+    sql = ('SELECT r.id, r.user_id, u.name, r.punch_time, r.kind, r.photo, r.duration '
+           'FROM records r LEFT JOIN users u ON u.id=r.user_id WHERE r.user_id=?')
+    args = [g.student_user['id']]
+    if day:
+        sql += ' AND date(r.punch_time)=?'
+        args.append(day)
+    sql += ' ORDER BY r.punch_time DESC LIMIT 200'
+    rows = conn.execute(sql, args).fetchall()
+    conn.close()
+    return jsonify(ok=True, records=[dict(row) for row in rows])
+
+
+@app.get('/api/student/weekly')
+@require_student
+def student_weekly():
+    """返回当前绑定学生自己的周统计。"""
+    ws = request.args.get('week_start')
+    try:
+        week = datetime.date.fromisoformat(ws) if ws else None
+    except ValueError:
+        return jsonify(ok=False, code='WEEK_START_INVALID', msg='week_start 日期格式错误'), 400
+    return jsonify(ok=True, stats=attendance.weekly_stats(g.student_user['id'], week))
+
+
+@app.get('/api/student/rank')
+@require_student
+def student_rank():
+    """返回学生排行榜；不接受 user_id，当前用户由 openid 决定。"""
+    ws = request.args.get('week_start')
+    try:
+        week = datetime.date.fromisoformat(ws) if ws else None
+    except ValueError:
+        return jsonify(ok=False, code='WEEK_START_INVALID', msg='week_start 日期格式错误'), 400
+    summary = attendance.weekly_summary(week)
+    for item in summary['users']:
+        item['days'] = len(attendance.weekly_stats(item['user_id'], week).get('days', []))
+    current_id = int(g.student_user['id'])
+    current = next((item for item in summary['users'] if int(item['user_id']) == current_id), None)
+    return jsonify(ok=True, stats=summary, current_user=current)
+
+
+@app.get('/api/student/presence')
+@require_student
+def student_presence():
+    """只返回当前学生是否在场，避免学生端获得全员实时信息。"""
+    users = attendance.current_presence()
+    current_id = int(g.student_user['id'])
+    current = next((item for item in users if int(item['user_id']) == current_id), None)
+    return jsonify(ok=True, present=current is not None, user=current)
 
 
 

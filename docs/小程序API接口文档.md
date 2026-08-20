@@ -1,6 +1,6 @@
 # 慧签 · 小程序 API 接口文档
 
-> 更新：2026-08-17（新增密码登录/改密码，共 25 个）｜ 后端已上线并实测通过
+> 更新：2026-08-20（新增小程序学生端接口，共 30 个）｜ 后端已上线并实测通过
 > 对接人：软件同学 ｜ 后端地址会变，见第 0 节
 
 ## 0. 后端地址（重要）
@@ -28,6 +28,23 @@
 **密码规则**：至少 8 位，且至少包含两种字符（小写/大写/数字/符号）。
 **默认密码**：录入人脸时自动生成 `123456qmx`（符合规则）；管理员可在树莓派桌面软件「修改密码」中改。
 
+## 0.2 学生端接口（小程序专用）
+
+小程序学生端登录成功后，使用本地生成并绑定的 `openid` 访问 `/api/student/*` 接口。
+这些接口不需要管理员 Bearer Token，服务端会根据 `openid` 找到绑定学生，并且只返回该学生允许看到的数据。
+
+小程序网络层会把 `openid` 作为 GET 查询参数发送；也支持服务端从 `X-MiniProgram-OpenID` 请求头读取。
+
+| 接口 | 方法 | 权限 | 用途 |
+|---|---|---|---|
+| `/api/student/me` | GET | 已绑定学生 | 返回当前学生资料 |
+| `/api/student/records` | GET | 已绑定学生 | 返回当前学生打卡记录，可选 `date=YYYY-MM-DD` |
+| `/api/student/weekly` | GET | 已绑定学生 | 返回当前学生周统计，可选 `week_start=YYYY-MM-DD` |
+| `/api/student/rank` | GET | 已绑定学生 | 返回本周排行榜和当前学生名次 |
+| `/api/student/presence` | GET | 已绑定学生 | 返回当前学生是否在场 |
+
+学生端接口与管理员接口分离。原有 `/api/users`、`/api/records`、`/api/weekly`、`/api/stats`、`/api/presence` 继续保留管理员 Token 保护，不由小程序调用。
+
 ## 1. 接口总览
 
 | # | 接口 | 方法 | 用途 |
@@ -39,10 +56,10 @@
 | 5 | `/api/bind` | POST | 绑定微信标识到用户 |
 | 6 | `/api/me` | GET | 我的信息（含角色） |
 | 7 | `/api/set_role` | POST | 设置角色 0学生/1管理员 |
-| 8 | `/api/users` | GET | 用户列表 |
-| 9 | `/api/records` | GET | 打卡记录 |
-| 10 | `/api/weekly` | GET | 我的周统计 |
-| 11 | `/api/stats` | GET | 全员周统计+排名 |
+| 8 | `/api/users` | GET | 管理员用户列表 |
+| 9 | `/api/records` | GET | 管理员打卡记录 |
+| 10 | `/api/weekly` | GET | 管理员查询指定用户周统计 |
+| 11 | `/api/stats` | GET | 管理员全员周统计+排名 |
 | 12 | `/api/activity` | GET | 操作日志 |
 | 13 | `/api/face_samples` | GET | 人脸样本列表 |
 | 14 | `/api/fingerprint/bind` | POST | 绑定指纹 |
@@ -104,6 +121,19 @@ JSON：`openid` +（`name` 或 `user_id`）。
 {"ok": true, "user": {"id": 1, "name": "梁健", "role": 0, "wechat_openid": "...", "created_at": "..."}}
 ```
 未绑定：404 `{"ok": false, "msg": "未绑定"}`（小程序据此提示先去绑定）
+
+### 6.1) 学生端接口
+
+学生端接口必须携带已绑定的 `openid`。小程序网络层会自动附加该参数。
+
+```http
+GET /api/student/records?openid=mini_xxx&date=2026-08-20
+GET /api/student/weekly?openid=mini_xxx
+GET /api/student/rank?openid=mini_xxx
+GET /api/student/presence?openid=mini_xxx
+```
+
+返回结构分别为 `records`、`stats`、`stats + current_user`、`present + user`。未绑定或缺少 `openid` 返回 401；学生端服务端始终使用绑定关系确定用户，不接受 `user_id` 覆盖查询范围。
 
 ### 7) POST /api/set_role
 JSON：`user_id` + `role`（0=学生，1=管理员）。
@@ -212,7 +242,7 @@ JSON（可只传要改的字段）：
 
 ## 3. 关键流程
 
-- **学生**：绑定（/api/bind）→ /api/me 拿 role → 首页今日状态+/api/presence → /api/records 打卡明细 → /api/weekly 周统计 → /api/stats 排行榜
+- **学生**：绑定（/api/login）→ `/api/student/me` 恢复身份 → `/api/student/records` 打卡明细 → `/api/student/weekly` 周统计 → `/api/student/rank` 排行榜
 - **管理员**：学生功能 + /api/enroll 录人 + /api/users 看全员 + /api/records?user_id= 查明细 + /api/set_role 设角色 + /api/activity 看日志 + /api/rename 改名 + /api/settings 改打卡模式/时间段 + /api/delete_user 删人
 
 ## 4. 打卡失败 msg 说明（/api/punch、现场联动）
