@@ -62,6 +62,15 @@ class AdminAuthTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.get_json()["code"], "ADMIN_CREDENTIALS_INVALID")
 
+    def test_unknown_admin_account_has_a_distinct_error_code(self):
+        response = self.client.post(
+            "/api/admin/auth/login",
+            json={"username": "missing-admin", "password": "AdminPass123!"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.get_json()["code"], "ADMIN_ACCOUNT_NOT_FOUND")
+
     def test_management_routes_require_an_admin_session(self):
         response = self.client.get("/api/users")
 

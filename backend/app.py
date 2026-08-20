@@ -186,6 +186,8 @@ def admin_login():
     data = request.get_json(silent=True) or {}
     account = attendance.authenticate_admin(data.get('username'), data.get('password'))
     if account is None:
+        if not attendance.admin_account_exists(data.get('username')):
+            return jsonify(ok=False, code='ADMIN_ACCOUNT_NOT_FOUND', msg='administrator account was not found'), 401
         return jsonify(ok=False, code='ADMIN_CREDENTIALS_INVALID', msg='administrator credentials are invalid'), 401
     token, session = attendance.issue_admin_session(account['id'])
     attendance.log_action('admin:' + account['username'], 'administrator login', 'session issued')
