@@ -249,6 +249,19 @@ def get_admin_by_id(admin_id):
     return row
 
 
+def admin_account_exists(username):
+    clean_username = validate_admin_username(username)
+    if clean_username is None:
+        return False
+    conn = get_db()
+    try:
+        return conn.execute(
+            'SELECT 1 FROM admin_accounts WHERE username=?', (clean_username,)
+        ).fetchone() is not None
+    finally:
+        conn.close()
+
+
 def authenticate_admin(username, password):
     clean_username = validate_admin_username(username)
     if clean_username is None:
