@@ -1,4 +1,4 @@
-"""慧签 face engine: MediaPipe 检测+关键点(眨眼) + dlib/face_recognition 识别"""
+"""慧签 face engine: MediaPipe 检测+关键点(随机动作活体) + dlib/face_recognition 识别"""
 import os
 import cv2
 import numpy as np
@@ -124,11 +124,53 @@ def get_embedding_multi(frame, box=None):
 
 
 NOSE_TIP = 1
+MOUTH_LEFT = 78
+MOUTH_RIGHT = 308
+MOUTH_TOP = 13
+MOUTH_BOTTOM = 14
 
 
 def nose_x(landmarks):
     """鼻尖归一化 x 坐标 (0~1)"""
     return landmarks[NOSE_TIP][0]
+
+
+def nose_y(landmarks):
+    """鼻尖归一化 y 坐标 (0~1)"""
+    return landmarks[NOSE_TIP][1]
+
+
+def mouth_open_ratio(landmarks):
+    """嘴部开合比例; 相对嘴宽归一化, 越大越像张嘴。"""
+    pts = np.array([(lm[0], lm[1]) for lm in landmarks], dtype=np.float32)
+    width = float(np.linalg.norm(pts[MOUTH_LEFT] - pts[MOUTH_RIGHT]))
+    height = float(np.linalg.norm(pts[MOUTH_TOP] - pts[MOUTH_BOTTOM]))
+    return height / (width + 1e-6)
+
+
+def mouth_open_detected(ratios, threshold=0.16, closed_threshold=0.10):
+    """要求采样中先有相对闭合状态, 后出现明显张嘴状态。"""
+    if len(ratios) < 4:
+        return False
+    split = max(1, len(ratios) // 3)
+    return min(ratios[:split]) <= closed_threshold and max(ratios[split:]) >= threshold
+
+
+def head_motion_detected(values, range_thresh=0.035, min_turns=1):
+    """检测头部在一个轴向上的往返运动。"""
+    if len(values) < 4 or max(values) - min(values) < range_thresh:
+        return False
+    turns = 0
+    prev_dir = 0
+    for i in range(1, len(values)):
+        delta = values[i] - values[i - 1]
+        if abs(delta) < 1e-4:
+            continue
+        current = 1 if delta > 0 else -1
+        if prev_dir and current != prev_dir:
+            turns += 1
+        prev_dir = current
+    return turns >= min_turns
 
 
 def head_shake_detected(nose_xs, range_thresh=0.03, min_turns=2):

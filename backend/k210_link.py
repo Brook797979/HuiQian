@@ -4,7 +4,7 @@
 AS608 未接入时自动回退到纯人脸打卡。
 接线: AS608 TX->USB-TTL RX, RX->USB-TTL TX, VCC->5V, GND->GND; USB-TTL -> Pi5 USB (57600)
 """
-import glob, os, sys, time, logging, threading, datetime, signal
+import glob, os, sys, time, logging, threading, datetime, signal, random
 import cv2
 import numpy as np
 import serial
@@ -19,9 +19,14 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 PHOTO_DIR = os.path.join(BASE, 'static', 'photos')
 BAUD = 115200
 FP_BAUD = 57600
-BURST_FRAMES = 10
-BURST_DELAY = 0.08
-LIVENESS_MODE = 'shake'      # 'shake' 或 'blink'
+BURST_FRAMES = 16
+BURST_DELAY = 0.10
+LIVENESS_PROMPT_DELAY = 0.65
+LIVENESS_ACTIONS = {
+    'lr': {'voice': 'liveness_lr', 'label': '左右摇头'},
+    'ud': {'voice': 'liveness_ud', 'label': '上下点头'},
+    'mouth': {'voice': 'liveness_mouth', 'label': '张嘴'},
+}
 FP_TIMEOUT = 10.0            # 指纹等待秒数(等手指按下)
 FP_STRICT = True             # True=指纹失败直接拒; False=回退纯人脸
 MIN_TRIGGER_INTERVAL = 2.0
@@ -63,21 +68,19 @@ def capture_burst():
     return frames
 
 
-def process_burst(frames, confirm_user_id=None, method='face'):
+def process_burst(frames, confirm_user_id=None, method='face', action='lr'):
     """识别 + 活体; confirm_user_id 指定时只和该用户比对"""
     best_face = None
-    blink_seen = False
     nose_xs = []
+    nose_ys = []
+    mouth_ratios = []
     truncated = False
-    for idx, f in enumerate(frames):
+    for f in frames:
         lms = face_engine.face_landmarks(f)
         if lms:
-            if LIVENESS_MODE == 'blink':
-                ear = face_engine.blink_ratio(lms[0])
-                if face_engine.is_blinking(lms[0]):
-                    blink_seen = True
-            else:
-                nose_xs.append(face_engine.nose_x(lms[0]))
+            nose_xs.append(face_engine.nose_x(lms[0]))
+            nose_ys.append(face_engine.nose_y(lms[0]))
+            mouth_ratios.append(face_engine.mouth_open_ratio(lms[0]))
         boxes = face_engine.detect_faces(f)
         if not boxes:
             continue
@@ -89,28 +92,43 @@ def process_burst(frames, confirm_user_id=None, method='face'):
         if best_face is None or size > best_face[0]:
             best_face = (size, f, face_engine.crop_face(f, boxes[0]))
     if best_face is None:
-        return None, 'CLOSE' if truncated else '未能提取人脸特征'
+        if frames:
+            photo = save_photo(frames[-1])
+            attendance.log_action('陌生人', '人脸验证失败',
+                                  '原因=未检测到人脸;动作=%s;抓拍=%s' %
+                                  (LIVENESS_ACTIONS.get(action, LIVENESS_ACTIONS['lr'])['label'], photo))
+        return None, 'CLOSE' if truncated else '未检测到人脸'
     emb = face_engine.get_embedding(best_face[2])
     if emb is None:
         log.info('HOG 未识别, CNN 兜底一次')
         emb = face_engine.get_embedding_cnn(best_face[2])
     if emb is None:
+        photo = save_photo(best_face[1])
+        attendance.log_action('陌生人', '人脸验证失败',
+                              '原因=未能提取人脸特征;动作=%s;抓拍=%s' %
+                              (LIVENESS_ACTIONS.get(action, LIVENESS_ACTIONS['lr'])['label'], photo))
         return None, '未能提取人脸特征'
     user, dist = attendance.match_face(emb, user_id=confirm_user_id)
     if user is None:
         # 未识别/异常: 抓拍留证(比赛展示点: 陌生人+指纹不符都有日志和照片)
         stranger_photo = save_photo(best_face[1])
-        if confirm_user_id is not None:
-            attendance.log_action('指纹用户#%d' % confirm_user_id, '人脸不匹配', stranger_photo)
-        else:
-            attendance.log_action('陌生人', '未识别抓拍', stranger_photo)
+        actor = '指纹用户#%d' % confirm_user_id if confirm_user_id is not None else '陌生人'
+        attendance.log_action(actor, '人脸验证失败',
+                              '原因=人脸不匹配;dist=%.3f;抓拍=%s' % (dist, stranger_photo))
         return None, '未识别(dist=%.2f)' % dist
-    if LIVENESS_MODE == 'shake':
-        log.info('nose_xs: %s', [round(x, 3) for x in nose_xs])
-        if not face_engine.head_shake_detected(nose_xs):
-            return None, '未检测到左右摇头'
-    elif LIVENESS_MODE == 'blink' and not blink_seen:
-        return None, '未检测到眨眼'
+    action_info = LIVENESS_ACTIONS.get(action, LIVENESS_ACTIONS['lr'])
+    if action == 'ud':
+        live_ok = face_engine.head_motion_detected(nose_ys)
+    elif action == 'mouth':
+        live_ok = face_engine.mouth_open_detected(mouth_ratios)
+    else:
+        live_ok = face_engine.head_motion_detected(nose_xs)
+    if not live_ok:
+        photo = save_photo(best_face[1])
+        detail = '动作=%s;原因=未完成动作;抓拍=%s' % (action_info['label'], photo)
+        attendance.log_action(user['name'], '活体验证失败', detail)
+        log.info('活体验证失败: %s (%s)', user['name'], detail)
+        return None, '活体验证失败: %s' % action_info['label']
     kind = attendance.next_kind(user['id'])
     if kind is None:
         return None, '当前不在可打卡时间'
@@ -119,7 +137,7 @@ def process_burst(frames, confirm_user_id=None, method='face'):
     if not ok:
         return None, info
     return {'ok': True, 'name': user['name'], 'kind': kind, 'dist': round(dist, 3),
-            'blink_seen': blink_seen, 'photo': photo, 'record_id': info}, None
+            'liveness_action': action_info['label'], 'photo': photo, 'record_id': info}, None
 
 
 def send_jpeg(k210, bgr, menu=None):
@@ -561,12 +579,16 @@ def main():
                         voice.play('fp_fail')
                         k210.write(b'FAIL\n')
                         continue
-            voice.play('shake_please')
+            action = random.choice(tuple(LIVENESS_ACTIONS))
+            action_info = LIVENESS_ACTIONS[action]
+            voice.play(action_info['voice'])
+            # 给用户听清随机指令并开始动作，再进入连续抓拍窗口。
+            time.sleep(LIVENESS_PROMPT_DELAY)
             frames = capture_burst()
             if user is not None:
-                result, err2 = process_burst(frames, confirm_user_id=user['id'], method='fp+face')
+                result, err2 = process_burst(frames, confirm_user_id=user['id'], method='fp+face', action=action)
             else:
-                result, err2 = process_burst(frames, method='face')
+                result, err2 = process_burst(frames, method='face', action=action)
             if result and result['ok']:
                 log.info('打卡成功: %s %s dist=%.2f', result['name'], result['kind'], result['dist'])
                 if result['kind'] == 'in':
@@ -590,9 +612,9 @@ def main():
                     log.warning('打卡失败: %s', err2)
                     if '不在可打卡' in str(err2):
                         voice.play('not_in_window')
-                    elif '摇头' in str(err2):
-                        voice.play('shake_please')
-                    elif '未能提取' in str(err2):
+                    elif '活体验证失败' in str(err2):
+                        voice.play(action_info['voice'])
+                    elif '未能提取' in str(err2) or '未检测到人脸' in str(err2):
                         voice.play('face_please')
                     else:
                         voice.play('fail_retry')
