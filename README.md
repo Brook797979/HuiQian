@@ -29,6 +29,11 @@
 ├── k210/                   # K210 端固件 + 刷机脚本
 │   ├── k210_main_standalone.py   # K210 主程序（面板/打卡/录入/排行榜）
 │   └── push_file.py / push_main_chunked.py   # 刷机工具
+├── admin-web/              # 管理电脑上的 Vue + Express 网页管理端
+│   ├── src/                # Vue 页面和组件
+│   ├── server/src/         # Web 网关和树莓派 API 代理
+│   ├── public/             # 静态资源
+│   └── package.json        # 前端和网关脚本
 └── README.md
 ```
 
@@ -52,67 +57,68 @@ K210 固件烧录：`python3 k210/push_file.py k210/k210_main_standalone.py /fla
 - `/api/login`（姓名+密码）登录并绑定 openid；`/api/set_password` 管理员改密码；
 - 规则：≥8 位、至少两种字符；密码**加盐哈希**存储。
 
-## 🛡️ 网页管理端管理员登录
+## 🛡️ 网页管理端
 
-网页管理端使用独立的 `admin_accounts` 表，不复用学生 `users` 表，也不依赖微信 `openid`。管理员密码使用 PBKDF2-SHA256 哈希保存，登录后返回 12 小时有效的 Bearer Token。
+- 🖥️ **Vue + Express 管理台**：在管理电脑上查看和维护考勤数据
+- 👥 **人员档案管理**：查看人员、修改姓名和角色
+- 📷 **考勤记录查询**：查看签到、签退、考勤照片和在场人数
+- 📊 **统计与日志**：查看周统计、操作日志和考勤汇总
+- ⚙️ **系统配置**：调整打卡时间窗口并管理普通管理员账号
+- 🔌 **本地网关代理**：Vite 开发服务器使用 `5173`，Express 网关使用 `3001`，统一代理树莓派 API
 
-首次在树莓派初始化管理员（只执行一次）：
+管理网页代码位于 `admin-web/`，运行前需要先启动树莓派后端。
 
-```bash
-cd backend
-python3 admin_cli.py create-admin --username admin
-```
-
-命令行会交互式要求输入两次密码。管理员用户名只能使用 3～32 位字母、数字、下划线或连字符；密码至少 10 位，并至少包含两类字符。不要把真实密码写进代码或提交到仓库。
-
-网页先请求登录接口：
-
-```http
-POST /api/admin/auth/login
-Content-Type: application/json
-
-{"username":"admin","password":"你的管理员密码"}
-```
-
-登录成功后，把返回的 `token` 放入后续管理请求的请求头：
-
-```http
-Authorization: Bearer <token>
-```
-
-管理员认证接口：
-
-| 方法 | 路径 | 作用 |
-|---|---|---|
-| POST | `/api/admin/auth/login` | 管理员登录并签发会话令牌 |
-| POST | `/api/admin/auth/logout` | 撤销当前会话 |
-| GET | `/api/admin/auth/me` | 查询当前管理员 |
-| GET | `/api/admin/accounts` | 查看管理员账号 |
-| POST | `/api/admin/accounts` | 新增管理员 |
-| POST | `/api/admin/accounts/<id>/status` | 启用或禁用管理员 |
-| POST | `/api/admin/accounts/<id>/password` | 重置管理员密码 |
-
-网页管理端使用的用户、考勤、统计、样本、指纹和系统设置接口均要求这个请求头。`/api/health`、`/api/punch`、`/api/login`、`/api/bind`、`/api/me` 保持公开，供硬件打卡和学生端使用。
-
-退出登录、禁用账号或重置密码后，原会话令牌立即失效；系统始终保留至少一个启用的管理员，避免后台无人可登录。
-
-部署或迁移树莓派时至少备份：
-
-```text
-backend/huiqian.db
-backend/face_library/
-backend/static/photos/
-```
-
-其中 `huiqian.db` 包含管理员账号哈希、会话、学生、样本索引和考勤记录；不要在日志、截图或网页前端保存管理员密码。
-
-认证测试运行方式（开发机或树莓派虚拟环境）：
+### 配置
 
 ```bash
-cd backend
-python3 -m unittest tests.test_admin_auth -v
-python3 -m py_compile app.py attendance.py auth_middleware.py admin_cli.py
+cd admin-web
+cp .env.example .env
 ```
+
+编辑 `.env`，将 `PI_BASE_URL` 设置为树莓派地址。例如：
+
+```env
+PI_BASE_URL=http://10.42.0.1:8000
+WEB_PORT=3001
+WEB_SESSION_SECRET=请替换为足够长的随机字符串
+```
+
+不要提交 `.env`，只提交 `.env.example`。
+
+### 开发运行
+
+需要先启动树莓派后端，再在 `admin-web` 目录安装依赖：
+
+```bash
+cd admin-web
+npm ci
+```
+
+另开两个终端分别启动网关和页面：
+
+```bash
+# 终端一
+npm run server:dev
+```
+
+```bash
+# 终端二
+npm run dev -- --host 127.0.0.1 --port 5173
+```
+
+浏览器访问 `http://127.0.0.1:5173/`。
+
+### 生产运行
+
+```bash
+cd admin-web
+npm ci
+npm run start
+```
+
+浏览器访问 `http://127.0.0.1:3001/`。生产模式下 Express 网关会同时提供网页静态文件。
+
+
 
 ## 🖥 核心流程
 | 流程 | 说明 |
