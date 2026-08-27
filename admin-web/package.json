@@ -1,0 +1,42 @@
+{
+  "name": "huiqian-admin-web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "vitest run --pool=forks --maxWorkers=1 --no-file-parallelism",
+    "test:server": "vitest run server/src --pool=forks --maxWorkers=1 --no-file-parallelism",
+    "server:dev": "tsx watch server/src/index.ts",
+    "server:start": "tsx server/src/index.ts",
+    "start": "npm run build && tsx server/src/index.ts",
+    "server:check": "tsc -p server/tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
+    "axios": "^1.19.0",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^17.4.2",
+    "element-plus": "^2.14.4",
+    "express": "^5.2.1",
+    "vue": "^3.5.40"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "^1.4.10",
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.13.3",
+    "@types/supertest": "^7.2.1",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "@vue/test-utils": "^2.4.11",
+    "@vue/tsconfig": "^0.9.1",
+    "jsdom": "^30.0.1",
+    "supertest": "^7.2.2",
+    "tsx": "^4.23.12",
+    "typescript": "~6.0.2",
+    "vite": "^8.2.0",
+    "vitest": "^4.1.10",
+    "vue-tsc": "^3.3.8"
+  }
+}
